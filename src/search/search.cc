@@ -61,105 +61,107 @@ Search::Search(Transform* transform) : transform_(transform) {
   }
 }
 
-void Search::run(const Cfg& target, CostFunction& fxn, Init init, SearchState& state, vector<TUnit>& aux_fxns) {
+void Search::run_parallel_tempering(const Cfg &target, CostFunction &fxn, Init init,
+                                    vector<SearchState> &replicas, vector<TUnit> &aux_fxns,
+                                    const vector<double> &betas)
+{
 
-  // Configure initial state
-  configure(target, fxn, state, aux_fxns);
+  const size_t num_replicas = betas.size();
+  assert(replicas.size() == num_replicas);
 
-  // Make sure target and rewrite are sound to begin with
-  assert(state.best_yet.is_sound());
-  assert(state.best_correct.is_sound());
-
-  // Statistics callback variables
-  // FIXME: Search only works with 'WeightedTransform', because it needs
-  // statistics.
-  move_statistics = vector<Statistics>(static_cast<WeightedTransform*>(transform_)->size());
-  num_iterations = 0;
-  const auto start = chrono::steady_clock::now();
-
-  // Early corner case bailouts
-  if (state.current_cost == 0) {
-    state.success = true;
-    state.best_correct = state.current;
-    state.best_correct_cost = 0;
-    return;
+  // Initialize all replicas
+  for (size_t i = 0; i < num_replicas; ++i)
+  {
+    configure(target, fxn, replicas[i], aux_fxns);
+    assert(replicas[i].best_yet.is_sound());
+    assert(replicas[i].best_correct.is_sound());
   }
 
-  TransformInfo ti;
-
+  vector<Statistics> stats(num_replicas);
+  const auto start = chrono::steady_clock::now();
   give_up_now = false;
   size_t iterations = 0;
-  for (iterations = 0; (state.current_cost > 0) && !give_up_now; ++iterations) {
-    // Invoke statistics callback if we've been running for long enough
-    if ((statistics_cb_ != nullptr) && (iterations % interval_ == 0) && iterations > 0) {
-      elapsed = duration_cast<duration<double>>(steady_clock::now() - start);
-      num_iterations = iterations;
-      statistics_cb_(get_statistics(), statistics_cb_arg_);
+
+  while (!give_up_now)
+  {
+    for (size_t i = 0; i < num_replicas; ++i)
+    {
+      SearchState &state = replicas[i];
+      const double beta = betas[i];
+
+      // Basic SA step
+      TransformInfo ti = (*transform_)(state.current);
+      if (!ti.success)
+        continue;
+
+      const auto p = prob_(gen_);
+      const auto max = state.current_cost - (log(p) / beta);
+      const auto new_res = fxn(state.current, max + 1);
+      const auto is_correct = new_res.first;
+      const auto new_cost = new_res.second;
+
+      if (new_cost > max)
+      {
+        (*transform_).undo(state.current, ti);
+        continue;
+      }
+
+      state.current_cost = new_cost;
+      if (new_cost < state.best_yet_cost)
+      {
+        state.best_yet = state.current;
+        state.best_yet_cost = new_cost;
+      }
+
+      if (is_correct && ((new_cost == 0) || (new_cost < state.best_correct_cost)))
+      {
+        state.success = true;
+        state.best_correct = state.current;
+        state.best_correct_cost = new_cost;
+        new_best_correct_cb_({state}, new_best_correct_cb_arg_);
+      }
+
+      if (state.current_cost == 0)
+      {
+        give_up_now = true;
+        break;
+      }
     }
 
-    // This is just here to clean up the for loop; check early exit conditions
-    if (timeout_itr_ > 0 && iterations >= timeout_itr_) {
+    // Attempt replica exchange between neighboring temperatures
+    for (size_t i = 0; i < num_replicas - 1; ++i)
+    {
+      auto &s1 = replicas[i];
+      auto &s2 = replicas[i + 1];
+
+      double delta = (betas[i] - betas[i + 1]) * (s2.current_cost - s1.current_cost);
+      double prob_swap = exp(min(0.0, delta));
+
+      if (prob_(gen_) < prob_swap)
+      {
+        swap(s1.current, s2.current);
+        swap(s1.current_cost, s2.current_cost);
+      }
+    }
+
+    if (++iterations >= timeout_itr_)
       break;
-    } else if (timeout_sec_ != steady_clock::duration::zero() &&
-               duration_cast<duration<double>>(steady_clock::now() - start) >= timeout_sec_) {
+    if (timeout_sec_ != steady_clock::duration::zero() &&
+        duration_cast<duration<double>>(steady_clock::now() - start) >= timeout_sec_)
+    {
       break;
-    }
-
-
-    ti = (*transform_)(state.current);
-    move_statistics[ti.move_type].num_proposed++;
-    if (!ti.success) {
-      continue;
-    }
-    move_statistics[ti.move_type].num_succeeded++;
-
-    const auto p = prob_(gen_);
-    const auto max = state.current_cost - (log(p) / beta_);
-
-    const auto new_res = fxn(state.current, max + 1);
-    const auto is_correct = new_res.first;
-    const auto new_cost = new_res.second;
-
-    if (new_cost > max) {
-      (*transform_).undo(state.current, ti);
-      continue;
-    }
-    move_statistics[ti.move_type].num_accepted++;
-    state.current_cost = new_cost;
-
-    const auto new_best_yet = new_cost < state.best_yet_cost;
-    if (new_best_yet) {
-      state.best_yet = state.current;
-      state.best_yet_cost = new_cost;
-    }
-    const auto new_best_correct_yet = is_correct && ((new_cost == 0)
-                                      || (new_cost < state.best_correct_cost));
-    if (new_best_correct_yet) {
-      state.success = true;
-      state.best_correct = state.current;
-      state.best_correct_cost = new_cost;
-
-      new_best_correct_cb_({state}, new_best_correct_cb_arg_);
-    }
-
-    if ((progress_cb_ != nullptr) && (new_best_yet || new_best_correct_yet)) {
-      progress_cb_({state}, progress_cb_arg_);
     }
   }
 
-  // update values for statistics
   elapsed = duration_cast<duration<double>>(steady_clock::now() - start);
   num_iterations = iterations;
 
-  if (give_up_now) {
-    state.interrupted = true;
+  for (auto &state : replicas)
+  {
+    state.current.recompute();
+    state.best_correct.recompute();
+    state.best_yet.recompute();
   }
-
-  // make sure Cfg's are in a valid state (e.g. liveness information, which we
-  // do not update during search)
-  state.current.recompute();
-  state.best_correct.recompute();
-  state.best_yet.recompute();
 }
 
 StatisticsCallbackData Search::get_statistics() const {
